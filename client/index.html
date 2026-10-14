@@ -1,0 +1,134 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>বাংলা ভয়েস এজেন্ট</title>
+<style>
+  :root { color-scheme: light dark; --fg:#111; --bg:#fafafa; --muted:#666; --accent:#1a7f5a; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg:#eee; --bg:#141414; --muted:#999; --accent:#4ade80; }
+  }
+  body { margin:0; padding:24px; font:15px/1.5 system-ui, sans-serif; background:var(--bg); color:var(--fg); }
+  main { max-width:640px; margin:0 auto; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  p.sub { color:var(--muted); margin:0 0 20px; }
+  button { font:inherit; padding:10px 20px; border-radius:8px; border:1px solid var(--accent);
+           background:var(--accent); color:#fff; cursor:pointer; }
+  button[disabled] { opacity:.5; cursor:default; }
+  button.secondary { background:transparent; color:var(--accent); }
+  #status { margin:16px 0; padding:10px 14px; border-radius:8px;
+            background:color-mix(in srgb, var(--fg) 6%, transparent); }
+  #meter { height:6px; border-radius:3px; background:color-mix(in srgb, var(--fg) 12%, transparent); overflow:hidden; }
+  #meter > div { height:100%; width:0%; background:var(--accent); transition:width .08s; }
+  #log { margin-top:18px; font-family:ui-monospace, monospace; font-size:12px; color:var(--muted);
+         white-space:pre-wrap; max-height:260px; overflow:auto; }
+</style>
+<main>
+  <h1>বাংলা ভয়েস এজেন্ট</h1>
+  <p class="sub">Speak Bangla. The agent replies over the same WebSocket, and you can talk over it.</p>
+  <button id="go">Start call</button>
+  <button id="stop" class="secondary" disabled>Hang up</button>
+  <div id="status">Idle.</div>
+  <div id="meter"><div></div></div>
+  <div id="log"></div>
+</main>
+<script>
+// The pipeline speaks bare 16-bit mono PCM in both directions (see
+// bvagent/serializer.py), so there is no codec or protocol to agree on here.
+const RATE = 16000;
+const url = new URLSearchParams(location.search).get("ws")
+         || `ws://${location.hostname || "localhost"}:8765`;
+
+const $ = (id) => document.getElementById(id);
+const log = (m) => { $("log").textContent += m + "\n"; $("log").scrollTop = 1e9; };
+const setStatus = (m) => $("status").textContent = m;
+
+let ws, ctx, micStream, node, playHead = 0;
+
+async function start() {
+  $("go").disabled = true;
+  setStatus("Requesting microphone…");
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    });
+  } catch (err) {
+    setStatus("Microphone denied: " + err.message);
+    $("go").disabled = false;
+    return;
+  }
+
+  // One context at the pipeline's rate, so neither side resamples.
+  ctx = new AudioContext({ sampleRate: RATE });
+  await ctx.resume();
+
+  ws = new WebSocket(url);
+  ws.binaryType = "arraybuffer";
+
+  ws.onopen = () => {
+    setStatus("Connected. Say something in Bangla.");
+    $("stop").disabled = false;
+    log("→ " + url);
+    startCapture();
+  };
+  ws.onclose = () => { setStatus("Call ended."); teardown(); };
+  ws.onerror = () => setStatus("Connection error — is the server running?");
+  ws.onmessage = (ev) => playChunk(new Int16Array(ev.data));
+}
+
+function startCapture() {
+  const src = ctx.createMediaStreamSource(micStream);
+  // ScriptProcessor is deprecated but universally available, and at 16 kHz its
+  // 2048-frame buffer is 128ms — below the VAD's own start/stop windows, so it
+  // adds no detectable delay to turn detection.
+  node = ctx.createScriptProcessor(2048, 1, 1);
+  const meter = document.querySelector("#meter > div");
+
+  node.onaudioprocess = (e) => {
+    const input = e.inputBuffer.getChannelData(0);
+    let peak = 0;
+    const pcm = new Int16Array(input.length);
+    for (let i = 0; i < input.length; i++) {
+      const s = Math.max(-1, Math.min(1, input[i]));
+      pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+      if (Math.abs(s) > peak) peak = Math.abs(s);
+    }
+    meter.style.width = Math.min(100, peak * 140) + "%";
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(pcm.buffer);
+  };
+
+  src.connect(node);
+  // Routed to a muted gain node: ScriptProcessor only fires while connected to
+  // the graph, but sending the mic to the speakers would echo.
+  const mute = ctx.createGain();
+  mute.gain.value = 0;
+  node.connect(mute);
+  mute.connect(ctx.destination);
+}
+
+function playChunk(pcm) {
+  if (!pcm.length) return;
+  const buf = ctx.createBuffer(1, pcm.length, RATE);
+  const out = buf.getChannelData(0);
+  for (let i = 0; i < pcm.length; i++) out[i] = pcm[i] / 0x8000;
+
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  src.connect(ctx.destination);
+  // Queue each chunk after the previous one so playback is gapless; if we have
+  // fallen behind, restart from now rather than compounding the lag.
+  const now = ctx.currentTime;
+  if (playHead < now) playHead = now + 0.02;
+  src.start(playHead);
+  playHead += buf.duration;
+}
+
+function teardown() {
+  $("go").disabled = false;
+  $("stop").disabled = true;
+  if (node) { node.disconnect(); node = null; }
+  if (micStream) { micStream.getTracks().forEach((t) => t.stop()); micStream = null; }
+  playHead = 0;
+}
+
+$("go").onclick = start;
+$("stop").onclick = () => { if (ws) ws.close(); teardown(); };
+</script>
